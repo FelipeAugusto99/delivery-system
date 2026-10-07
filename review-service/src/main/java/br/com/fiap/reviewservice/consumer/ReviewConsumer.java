@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
@@ -28,21 +30,43 @@ public class ReviewConsumer {
         String dishName = review.get("dishName").asText();
         int rating = review.get("rating").asInt();
 
-        buffer.compute(dishId, (id, current) -> {
-            if (current == null) {
-                return new ReviewBuffer(dishName, rating, 1);
-            }
+        synchronized (buffer) {
+            buffer.compute(dishId, (id, current) -> {
+                if (current == null) {
+                    return new ReviewBuffer(dishName, rating, 1);
+                }
 
-            return new ReviewBuffer(
-                    dishName,
-                    current.sumRatings() + rating,
-                    current.count() + 1
-            );
-        });
+                return new ReviewBuffer(
+                        dishName,
+                        current.sumRatings() + rating,
+                        current.count() + 1
+                );
+            });
+        }
     }
 
-    public ConcurrentHashMap<Long, ReviewBuffer> getBuffer() {
-        return buffer;
+    public Map<Long, ReviewBuffer> drainBuffer() {
+        synchronized (buffer) {
+            Map<Long, ReviewBuffer> batch = new HashMap<>(buffer);
+            buffer.clear();
+            return batch;
+        }
+    }
+
+    public void restoreBuffer(Map<Long, ReviewBuffer> batch) {
+        synchronized (buffer) {
+            batch.forEach((dishId, previous) ->
+                    buffer.merge(
+                            dishId,
+                            previous,
+                            (current, restored) -> new ReviewBuffer(
+                                    current.dishName(),
+                                    current.sumRatings() + restored.sumRatings(),
+                                    current.count() + restored.count()
+                            )
+                    )
+            );
+        }
     }
 
     public record ReviewBuffer(

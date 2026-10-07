@@ -5,9 +5,8 @@ import br.com.fiap.reviewservice.model.ReviewSummary;
 import br.com.fiap.reviewservice.repository.ReviewSummaryRepository;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 
-import java.util.HashMap;
 import java.util.Map;
 
 @Service
@@ -15,46 +14,55 @@ public class ReviewBatchService {
 
     private final ReviewConsumer reviewConsumer;
     private final ReviewSummaryRepository repository;
+    private final TransactionTemplate transactionTemplate;
 
     public ReviewBatchService(
             ReviewConsumer reviewConsumer,
-            ReviewSummaryRepository repository
+            ReviewSummaryRepository repository,
+            TransactionTemplate transactionTemplate
     ) {
         this.reviewConsumer = reviewConsumer;
         this.repository = repository;
+        this.transactionTemplate = transactionTemplate;
     }
 
     @Scheduled(fixedRate = 5000)
-    @Transactional
     public void processReviews() {
 
-        Map<Long, ReviewConsumer.ReviewBuffer> batch = new HashMap<>();
+        Map<Long, ReviewConsumer.ReviewBuffer> batch =
+                reviewConsumer.drainBuffer();
 
-        reviewConsumer.getBuffer().forEach((dishId, ignored) -> {
-            ReviewConsumer.ReviewBuffer removed =
-                    reviewConsumer.getBuffer().remove(dishId);
+        if (batch.isEmpty()) {
+            return;
+        }
 
-            if (removed != null) {
-                batch.put(dishId, removed);
-            }
-        });
+        try {
+            transactionTemplate.executeWithoutResult(status -> {
+                batch.forEach((dishId, data) -> {
 
-        batch.forEach((dishId, data) -> {
+                    ReviewSummary summary = repository.findById(dishId)
+                            .orElseGet(() -> new ReviewSummary(
+                                    dishId,
+                                    data.dishName(),
+                                    0L,
+                                    0L
+                            ));
 
-            ReviewSummary summary = repository.findById(dishId)
-                    .orElseGet(() -> new ReviewSummary(
-                            dishId,
-                            data.dishName(),
-                            0L,
-                            0L
-                    ));
+                    summary.setCount(
+                            summary.getCount() + data.count()
+                    );
 
-            summary.setCount(summary.getCount() + data.count());
-            summary.setSumRatings(
-                    summary.getSumRatings() + data.sumRatings()
-            );
+                    summary.setSumRatings(
+                            summary.getSumRatings() + data.sumRatings()
+                    );
 
-            repository.save(summary);
-        });
+                    repository.save(summary);
+                });
+            });
+
+        } catch (RuntimeException e) {
+            reviewConsumer.restoreBuffer(batch);
+            throw e;
+        }
     }
 }
